@@ -1,0 +1,21 @@
+# 🚨 SECRETS (NEVER UPLOAD!)
+.env
+
+# 🗄️ Databases & User History
+*.db
+conversation_history.json
+
+# 🖼️ Images & Image Stores
+image_store/
+*.jpg
+*.jpeg
+*.png
+
+# 📜 Logs
+*.log
+
+# 🗑️ OS & Jupyter Junk
+.DS_Store
+.ipynb_checkpoints/
+Untitled*.ipynb
+untitled*.txt

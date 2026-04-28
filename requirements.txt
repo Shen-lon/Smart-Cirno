@@ -1,0 +1,10 @@
+discord.py
+python-dotenv
+aiohttp
+fastapi
+uvicorn
+pydantic
+numpy
+scikit-learn
+## run the command below to install all libraries and req to run this bot, before running anything.
+## pip install -r requirements.txt
