@@ -99,8 +99,9 @@ CHIME_RECENT_WINDOW_SEC = 60 * 60 * 6  # only chime if there's been activity in 
 # Personality-summary knobs.
 ENABLE_PERSONALITY_SUMMARIES = True
 SUMMARY_MIN_NEW_MESSAGES = 5          # re-summarize after N new messages from a user
-SUMMARY_MAX_USER_MESSAGES = 80         # how many recent user messages to feed into the summarizer
-SUMMARY_MAX_TOKENS = 400               # cap on the generated summary's length
+SUMMARY_MAX_USER_MESSAGES = 150        # how many recent user messages to feed into the summarizer
+                                       # (more = better evidence-grounding for specific observations)
+SUMMARY_MAX_TOKENS = 350               # cap on the generated summary's length
 
 # Image memory knobs.
 # Cirno saves an image to long-term memory only when she's pinged on the
@@ -113,6 +114,33 @@ IMAGE_RAG_MIN_SCORE = 0.55             # caption-similarity threshold (lower tha
                                        #   captions are short and lossy by nature)
 IMAGE_CAPTION_MAX_TOKENS = 120         # caption length budget — one or two sentences
 IMAGE_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024  # don't try to caption huge files (>8MB)
+
+# Server emoji memory.
+# Cirno learns server custom emojis incrementally: when she observes one in
+# a message, she captions it once with the vision model (intent-focused
+# prompt — "what does this emoji express?") and embeds the caption. On
+# every chat turn, semantic search returns emojis whose captions match
+# the conversation, and they're injected into the prompt as candidates
+# she can use in her reply via the standard <:name:id> / <a:name:id> syntax.
+#
+# Adaptive injection: instead of a fixed top-k, we inject every match whose
+# similarity is >= EMOJI_RAG_MIN_SCORE, capped by EMOJI_RAG_HARD_CAP to
+# prevent runaway "every emoji matches 'cool'" cases.
+ENABLE_EMOJI_MEMORY = True
+EMOJI_RAG_MIN_SCORE = 0.55             # similarity threshold
+EMOJI_RAG_HARD_CAP = 8                 # never inject more than this many even if all match
+EMOJI_CAPTION_MAX_TOKENS = 80          # captions are short ("expression of laughter")
+EMOJI_OBSERVE_DEBOUNCE_SEC = 5         # don't try to caption same emoji twice in a row
+
+# In-memory set of emoji IDs we already know about (per bot session). Avoids
+# hitting the history service's /check_emoji_known endpoint for every emoji
+# in every message. Populated on startup from the existing DB rows and
+# updated as new emojis are captioned.
+_known_emoji_ids = set()  # set[str(emoji_id)]
+# Emoji IDs we're currently captioning. Prevents two concurrent captioning
+# tasks for the same emoji racing each other (would waste vision-model time
+# and the second insert would just overwrite the first).
+_captioning_now = set()
 # When the bot's reply contains [recall_image: N] for an image we offered,
 # we strip the marker from text and attach the bytes. This regex is permissive
 # about whitespace inside the brackets.
@@ -818,6 +846,48 @@ async def get_relevant_context(channel_id, query, limit=RAG_MAX_RESULTS,
         return []
 
 
+# --- User-targeted RAG helpers ----------------------------------------------
+# These wrap /search_user_messages and /get_messages_about_user. They power
+# the intent-routed retrieval ("what did X say about Y" / "what do you think
+# of X"). Strict per-user filtering at the SQL level produces much sharper
+# context blocks than channel-wide cosine search.
+
+async def search_user_messages(channel_id, user_id, query, limit=10):
+    """GET /search_user_messages — semantic search restricted to one user.
+    Returns the same shape as /get_relevant_context (id, user, content,
+    timestamp, score, etc) but everything came from `user_id`."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/search_user_messages/{channel_id}/{user_id}",
+                params={"query": query, "limit": limit},
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+                logger.error(f"search_user_messages: {r.status}")
+    except Exception as e:
+        logger.error(f"search_user_messages failed: {e}")
+    return []
+
+
+async def get_messages_about_user(channel_id, user_id, limit=20):
+    """GET /get_messages_about_user — messages where OTHERS mentioned or
+    replied to this user. Used for forming opinions ('what do you think of
+    @user') alongside what the user themselves said."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/get_messages_about_user/{channel_id}/{user_id}",
+                params={"limit": limit},
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+                logger.error(f"get_messages_about_user: {r.status}")
+    except Exception as e:
+        logger.error(f"get_messages_about_user failed: {e}")
+    return []
+
+
 # --- Image memory HTTP clients ----------------------------------------------
 # These talk to the chat history service's /save_image, /get_relevant_images,
 # /get_image_bytes, and /delete_user_images endpoints. Kept separate from the
@@ -884,6 +954,120 @@ async def fetch_image_bytes(image_id):
                 logger.error(f"get_image_bytes: {r.status}")
     except Exception as e:
         logger.error(f"fetch_image_bytes failed: {e}")
+    return None
+
+
+async def fetch_image_store_stats(channel_id):
+    """GET /image_store_stats — diagnostic counts + recent caption samples
+    for this channel. Used by /diagnose_images. Returns dict or None."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/image_store_stats/{channel_id}"
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+                logger.error(f"image_store_stats: {r.status}")
+    except Exception as e:
+        logger.error(f"fetch_image_store_stats failed: {e}")
+    return None
+
+
+# --- Emoji memory HTTP clients ----------------------------------------------
+# Mirror the four /save_emoji /get_relevant_emojis /check_emoji_known
+# /delete_guild_emojis_except endpoints on the history service. Same
+# error-handling pattern as the other client wrappers.
+
+async def check_emoji_known(emoji_id):
+    """Return True if the history service already has a captioned row for
+    this emoji_id. Cheap GET. Used to skip captioning duplicates."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/check_emoji_known/{emoji_id}"
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return bool(data.get("known")) and bool(data.get("has_caption"))
+    except Exception as e:
+        logger.debug(f"check_emoji_known failed: {e}")
+    return False
+
+
+async def save_emoji_to_memory(emoji_id, guild_id, name, animated, caption):
+    """POST /save_emoji. Returns True on success, False otherwise."""
+    payload = {
+        "emoji_id": str(emoji_id),
+        "guild_id": str(guild_id),
+        "name": name,
+        "animated": bool(animated),
+        "caption": caption,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{CHAT_HISTORY_SERVICE_URL}/save_emoji", json=payload,
+            ) as r:
+                if r.status == 200:
+                    return True
+                logger.error(f"save_emoji: {r.status} {await r.text()}")
+    except Exception as e:
+        logger.error(f"save_emoji_to_memory failed: {e}")
+    return False
+
+
+async def get_relevant_emojis(guild_id, query, limit=EMOJI_RAG_HARD_CAP,
+                              min_score=EMOJI_RAG_MIN_SCORE):
+    """GET /get_relevant_emojis — semantic search over caption embeddings.
+    Returns a list of dicts (emoji_id, name, animated, caption, score) or []."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/get_relevant_emojis/{guild_id}",
+                params={"query": query, "limit": limit, "min_score": min_score},
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+                logger.error(f"get_relevant_emojis: {r.status}")
+    except Exception as e:
+        logger.error(f"get_relevant_emojis failed: {e}")
+    return []
+
+
+async def delete_guild_emojis_except(guild_id, keep_ids):
+    """POST /delete_guild_emojis_except — prune emojis no longer in the guild.
+    `keep_ids` is the list of currently-valid emoji IDs (strings). Empty
+    list nukes everything for that guild — make sure that's what you want."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # FastAPI accepts repeated query params for List[str]
+            params = [("guild_id", str(guild_id))]
+            for kid in keep_ids:
+                params.append(("keep_ids", str(kid)))
+            async with session.post(
+                f"{CHAT_HISTORY_SERVICE_URL}/delete_guild_emojis_except",
+                params=params,
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return int(data.get("deleted", 0))
+                logger.error(f"delete_guild_emojis_except: {r.status}")
+    except Exception as e:
+        logger.error(f"delete_guild_emojis_except failed: {e}")
+    return 0
+
+
+async def fetch_emoji_store_stats(guild_id):
+    """GET /emoji_store_stats — diagnostic counts."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/emoji_store_stats/{guild_id}"
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+    except Exception as e:
+        logger.debug(f"fetch_emoji_store_stats failed: {e}")
     return None
 
 
@@ -1369,6 +1553,167 @@ def _extract_from_thinking(thinking_text):
             return d
 
     return ""
+
+
+# --- Intent classification -------------------------------------------------
+# Before retrieval, we classify the incoming message into one of a small
+# fixed set of intents. The classifier is a single LLM call with thinking
+# disabled and a tight token budget, so it's quick (~500ms-1s in practice).
+# It runs in parallel with regular RAG retrieval to overlap the latency.
+
+# Per-channel record of the most recent intent decision and the contexts
+# retrieved for it. Used by the /why slash command. Keyed by channel id;
+# only stores the most recent reply per channel (no history). In-memory only.
+_last_intent_state = {}  # {channel_id_str: dict}
+
+
+# Possible intent labels. The classifier prompt is restricted to these.
+INTENT_USER_TOPIC = "user_topic"            # "what did @user say about X"
+INTENT_OPINION_OF_USER = "opinion_of_user"  # "what do you think of @user"
+INTENT_GENERAL_RECALL = "general_recall"    # "remember when..." / topical search
+INTENT_NORMAL = "normal"                    # everything else — chat, no special handling
+ALL_INTENTS = {INTENT_USER_TOPIC, INTENT_OPINION_OF_USER,
+               INTENT_GENERAL_RECALL, INTENT_NORMAL}
+
+
+INTENT_CLASSIFIER_PROMPT = (
+    "You classify a Discord message into ONE of four intents. The user is "
+    "talking to a bot named Cirno. Output STRICT JSON only — no prose, no "
+    "code fences. The JSON must have exactly two keys: \"intent\" (one of "
+    "the four labels below) and \"target_user\" (a Discord mention string "
+    "like \"<@123>\" if the intent is about a specific user, otherwise null).\n\n"
+    "Intent labels:\n"
+    "  user_topic       — message asks what a SPECIFIC user said/thinks/did "
+    "about a SPECIFIC topic. Examples: 'what did @alice say about her gpu', "
+    "'did @bob mention the trip', 'has @x talked about X yesterday'.\n"
+    "  opinion_of_user  — message asks for the BOT'S opinion of a specific "
+    "user, or asks the bot to characterize a user. Examples: 'what do you "
+    "think of @bob', 'describe @alice', 'is @x cool'.\n"
+    "  general_recall   — message asks the bot to remember or look up "
+    "something topical with no specific person. Examples: 'remember the "
+    "discussion about cookies', 'when did we talk about the trip', "
+    "'find that link from last week'.\n"
+    "  normal           — everything else. Casual chat, jokes, questions to "
+    "the bot, replies, statements, the vast majority of messages.\n\n"
+    "Rules:\n"
+    "- If you are unsure, choose normal. Most messages are normal.\n"
+    "- target_user is the @mention string of the user the message is "
+    "ABOUT (the subject), not the speaker. Only for user_topic and "
+    "opinion_of_user. If the user mention is given as plain text like "
+    "'alice', try to extract it; if there is no clear user, return null.\n"
+    "- Output a single JSON object on one line. Nothing else."
+)
+
+
+def _extract_user_mentions(text):
+    """Pull explicit <@id> mentions out of a string. Returns list of bare IDs.
+    Used as a sanity check on the classifier's target_user output — if the
+    message has no @mentions but the classifier returned one, the classification
+    is suspect."""
+    if not text:
+        return []
+    return _MENTION_RE.findall(text)
+
+
+async def classify_intent(message_text, mentioned_user_ids):
+    """
+    Classify `message_text` into one of the four intents. Returns a dict:
+        {"intent": <label>, "target_user_id": <bare id or None>, "raw": <model output>}
+
+    `mentioned_user_ids` is the list of bare IDs we extracted from the message
+    ahead of time. We use it to validate the classifier's target_user — if it
+    claims someone was mentioned but we didn't actually see that mention, we
+    fall back to normal.
+
+    On error or invalid output, we always return INTENT_NORMAL — being wrong
+    here just means we use the default retrieval path instead of a targeted
+    one, which is graceful degradation.
+    """
+    if not message_text or not message_text.strip():
+        return {"intent": INTENT_NORMAL, "target_user_id": None, "raw": ""}
+
+    # Quick early-exit: if the message has no @mentions AND no question words,
+    # it's almost certainly normal — skip the LLM round-trip entirely.
+    has_mention = bool(mentioned_user_ids)
+    has_question_word = bool(_re_module.search(
+        r'\b(what|when|did|does|is|was|were|how|why|who|tell\s+me|describe|'
+        r'remember|recall|find)\b',
+        message_text, _re_module.IGNORECASE,
+    ))
+    if not has_mention and not has_question_word:
+        return {"intent": INTENT_NORMAL, "target_user_id": None, "raw": "(skipped)"}
+
+    prompt = [
+        {"role": "system", "content": INTENT_CLASSIFIER_PROMPT},
+        {"role": "user", "content": f"Classify this message:\n{message_text}"},
+    ]
+    raw = await get_llm_response(
+        prompt,
+        retry=False,
+        model=MODEL_ID_SUMMARIZER,  # smaller/faster model is fine for this
+        enable_thinking=False,
+        num_predict=80,
+        temperature=0.1,            # near-deterministic; we want the "obvious" label
+    )
+    if not raw:
+        return {"intent": INTENT_NORMAL, "target_user_id": None, "raw": ""}
+
+    raw = raw.strip()
+    # Sometimes Gemma wraps in ```json``` fences despite the prompt — strip them.
+    if raw.startswith("```"):
+        raw = _re_module.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re_module.sub(r'\s*```$', '', raw).strip()
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        # Try to extract the first {...} block in case the model added prose
+        m = _re_module.search(r'\{[^{}]*\}', raw)
+        if not m:
+            return {"intent": INTENT_NORMAL, "target_user_id": None, "raw": raw}
+        try:
+            data = json.loads(m.group(0))
+        except (TypeError, ValueError):
+            return {"intent": INTENT_NORMAL, "target_user_id": None, "raw": raw}
+
+    intent = (data.get("intent") or "").strip().lower()
+    if intent not in ALL_INTENTS:
+        intent = INTENT_NORMAL
+
+    # Normalize target_user — accept "<@123>" / "<@!123>" / "123" / null
+    target_raw = data.get("target_user")
+    target_id = None
+    if target_raw and isinstance(target_raw, str):
+        target_raw = target_raw.strip()
+        m = _re_module.match(r'^<@!?(\d{15,25})>$', target_raw)
+        if m:
+            target_id = m.group(1)
+        elif target_raw.isdigit() and 15 <= len(target_raw) <= 25:
+            target_id = target_raw
+
+    # Validation: if the classifier picked a user_topic / opinion_of_user
+    # intent but didn't return a target user (or the target wasn't actually
+    # in the message), demote to normal. Saves us from confused queries.
+    if intent in (INTENT_USER_TOPIC, INTENT_OPINION_OF_USER):
+        if not target_id:
+            intent = INTENT_NORMAL
+        elif mentioned_user_ids and target_id not in mentioned_user_ids:
+            # Classifier hallucinated a user not in the message. Drop the
+            # target but keep the intent IF we have at least one real mention
+            # we can substitute. Otherwise demote.
+            if mentioned_user_ids:
+                target_id = mentioned_user_ids[0]
+            else:
+                intent = INTENT_NORMAL
+                target_id = None
+
+    return {"intent": intent, "target_user_id": target_id, "raw": raw}
+
+
+def _record_intent_state(channel_id, **kwargs):
+    """Save the most recent intent + retrieval results for this channel so
+    /why can show them. Replaces the previous record (no history)."""
+    _last_intent_state[str(channel_id)] = kwargs
 
 
 def _to_ollama_format(messages):
@@ -2055,9 +2400,113 @@ async def get_structured_input(channel_id, current_message):
         if after_dt is None or after_dt < cutoff_ts:
             after_dt = cutoff_ts
 
-    relevant_context = await get_relevant_context(
-        channel_id, rag_query, after=after_dt, before=before_dt,
+    # Intent classification + default RAG run in parallel. The classifier is
+    # a small LLM call (~500ms-1s); the default RAG is a SQL query + cosine
+    # similarity scan (~tens of ms). Running them concurrently means total
+    # added latency is bounded by the classifier alone.
+    mentioned_ids_in_msg = _extract_user_mentions(current_message.content)
+    intent_task = asyncio.create_task(
+        classify_intent(current_message.content, mentioned_ids_in_msg)
     )
+    default_rag_task = asyncio.create_task(
+        get_relevant_context(
+            channel_id, rag_query, after=after_dt, before=before_dt,
+        )
+    )
+
+    intent_info = await intent_task
+    intent_label = intent_info.get("intent", INTENT_NORMAL)
+    intent_target_id = intent_info.get("target_user_id")
+
+    # Default RAG always runs — we use it as fallback if the intent-routed
+    # retrieval comes back empty, and as supplementary context for some
+    # intents.
+    relevant_context = await default_rag_task
+
+    # Track what we used for /why to inspect.
+    intent_record = {
+        "intent": intent_label,
+        "target_user_id": intent_target_id,
+        "raw_classifier_output": intent_info.get("raw", ""),
+        "rag_query": rag_query,
+        "default_hits_count": len(relevant_context),
+        "intent_hits_count": 0,
+        "supplementary_blocks": [],
+    }
+
+    # Intent-routed retrieval — this can REPLACE relevant_context (when the
+    # intent is user-targeted and we have a real subject) or ADD to the
+    # context with separate labeled blocks (for opinion_of_user, where we
+    # want both the user's messages and what others said about them).
+    user_topic_hits = []
+    opinion_user_hits = []
+    opinion_about_hits = []
+
+    if intent_label == INTENT_USER_TOPIC and intent_target_id:
+        # "what did @X say about Y" — semantic search restricted to that user
+        try:
+            user_topic_hits = await search_user_messages(
+                channel_id, intent_target_id, rag_query, limit=12,
+            )
+            user_topic_hits = [h for h in user_topic_hits
+                               if not _is_before_cutoff(channel_id, h)]
+            intent_record["intent_hits_count"] = len(user_topic_hits)
+            logger.info(f"intent={intent_label} target={intent_target_id} "
+                        f"hits={len(user_topic_hits)} "
+                        f"(replacing default RAG of {len(relevant_context)} hits)")
+            if user_topic_hits:
+                # Replace the default channel-wide RAG: for this intent, the
+                # user-filtered messages are dramatically more relevant. The
+                # default may have nothing from the target user at all.
+                relevant_context = user_topic_hits
+        except Exception as e:
+            logger.warning(f"user_topic retrieval failed: {e}")
+
+    elif intent_label == INTENT_OPINION_OF_USER and intent_target_id:
+        # "what do you think of @X" — fetch a sample of X's messages,
+        # messages where others mentioned/replied to X, and X's stored
+        # personality summary. We don't replace the default RAG here; we
+        # ADD them as separately labeled blocks so the model knows what
+        # each piece is.
+        try:
+            # X's own recent messages (semantic search against rag_query
+            # if there's a topic, else just recent)
+            opinion_user_hits = await search_user_messages(
+                channel_id, intent_target_id,
+                rag_query if rag_query.strip() else current_message.content,
+                limit=12,
+            )
+            opinion_user_hits = [h for h in opinion_user_hits
+                                 if not _is_before_cutoff(channel_id, h)]
+
+            # Messages from OTHERS about X
+            opinion_about_hits = await get_messages_about_user(
+                channel_id, intent_target_id, limit=15,
+            )
+            opinion_about_hits = [h for h in opinion_about_hits
+                                  if not _is_before_cutoff(channel_id, h)]
+
+            intent_record["intent_hits_count"] = (
+                len(opinion_user_hits) + len(opinion_about_hits)
+            )
+            intent_record["supplementary_blocks"] = [
+                f"by_target ({len(opinion_user_hits)} msgs)",
+                f"about_target ({len(opinion_about_hits)} msgs)",
+            ]
+            logger.info(f"intent={intent_label} target={intent_target_id} "
+                        f"by_target={len(opinion_user_hits)} "
+                        f"about_target={len(opinion_about_hits)}")
+        except Exception as e:
+            logger.warning(f"opinion_of_user retrieval failed: {e}")
+
+    elif intent_label == INTENT_GENERAL_RECALL:
+        # General recall is the same as normal — channel-wide cosine RAG —
+        # but we know the user wants memory rather than chat, so we don't
+        # do anything special here. The default RAG's already there.
+        intent_record["intent_hits_count"] = len(relevant_context)
+
+    # Persist for /why diagnostics
+    _record_intent_state(channel_id, **intent_record)
 
     # ctxbreak enforcement — drop everything older than the cutoff from BOTH
     # the sliding window and RAG. The service-side `after` filter (above) does
@@ -2112,6 +2561,25 @@ async def get_structured_input(channel_id, current_message):
         except Exception as e:
             logger.debug(f"Could not load personality for current speaker: {e}")
 
+        # If the intent is opinion_of_user, also load the TARGET's personality
+        # summary. The speaker's summary is about the user asking; the target's
+        # summary is what the bot is being asked to opine on. Both go into the
+        # system prompt as factual background.
+        if intent_label == INTENT_OPINION_OF_USER and intent_target_id:
+            try:
+                target_personality = await get_personality(
+                    str(channel_id), intent_target_id,
+                )
+                if target_personality and (target_personality.get('summary') or '').strip():
+                    target_name = await _resolve_user_name(intent_target_id, guild=guild)
+                    target_name = target_name or intent_target_id
+                    system_content += (
+                        f"What you remember about @{target_name} (the user being "
+                        f"asked about): {target_personality['summary'].strip()}\n\n"
+                    )
+            except Exception as e:
+                logger.debug(f"Could not load personality for target user: {e}")
+
     structured_input = [
         {"role": "system", "content": system_content.strip()}
     ]
@@ -2138,6 +2606,40 @@ async def get_structured_input(channel_id, current_message):
             "role": "assistant",
             "content": "(noted)",
         })
+
+    # If the intent classifier said the user is asking for the bot's
+    # opinion of someone, inject TWO additional context blocks: the
+    # target's own messages, and messages where others mentioned them.
+    # These are labeled distinctly so the model knows which is which when
+    # forming an opinion.
+    if intent_label == INTENT_OPINION_OF_USER and intent_target_id:
+        target_mention_for_label = await _resolve_user_name(
+            intent_target_id, guild=guild
+        ) or intent_target_id
+
+        if opinion_user_hits:
+            block = [f"[What @{target_mention_for_label} themselves said in this "
+                     f"channel — use these to characterize how they speak/think:]"]
+            for msg in opinion_user_hits:
+                safe_content = await rewrite(msg.get('content', ''), msg.get('id'))
+                ts = msg.get('timestamp', '')
+                block.append(f"  - ({_relative_time(ts)}): {safe_content}")
+            block.append(f"[End @{target_mention_for_label}'s own messages.]")
+            structured_input.append({"role": "user", "content": "\n".join(block)})
+            structured_input.append({"role": "assistant", "content": "(noted)"})
+
+        if opinion_about_hits:
+            block = [f"[What OTHERS said TO or ABOUT @{target_mention_for_label} "
+                     f"in this channel — use these to ground your opinion in "
+                     f"context, but don't take any single opinion as fact:]"]
+            for msg in opinion_about_hits:
+                safe_content = await rewrite(msg.get('content', ''), msg.get('id'))
+                safe_user = await rewrite(msg.get('user', ''), None)
+                ts = msg.get('timestamp', '')
+                block.append(f"  - {safe_user} ({_relative_time(ts)}): {safe_content}")
+            block.append(f"[End messages about @{target_mention_for_label}.]")
+            structured_input.append({"role": "user", "content": "\n".join(block)})
+            structured_input.append({"role": "assistant", "content": "(noted)"})
 
     current_msg_id = str(current_message.id)
     current_author_mention = f"<@{current_message.author.id}>"
@@ -2394,6 +2896,103 @@ async def get_structured_input(channel_id, current_message):
             "role": "assistant",
             "content": "(noted)",
         })
+
+    # Server emoji direct-name resolution. When the user's message contains
+    # `:name:` text (e.g. "use the :cutecirno: one"), they're naming an emoji
+    # explicitly. Semantic RAG might not catch this (the user's phrasing
+    # doesn't necessarily match the caption), so we do a fast direct lookup
+    # against the live guild emoji list — no LLM, no embedding. If we get a
+    # name match, we inject it as a HIGH-CONFIDENCE candidate distinct from
+    # the fuzzy RAG hits.
+    name_resolved_emojis = []  # list of (name, id, animated)
+    if ENABLE_EMOJI_MEMORY and current_message.guild is not None:
+        try:
+            # Find :name: patterns. Must be flanked by non-word chars so we
+            # don't false-positive on URLs / file paths / code. Also exclude
+            # already-resolved <:name:id> form (would have brackets around it).
+            # Discord emoji names are alnum + underscore, 2-32 chars typically.
+            naming_re = _re_module.compile(
+                r'(?<![<\w]):([A-Za-z0-9_]{2,32}):(?!\d)'
+            )
+            requested_names = {
+                m.group(1).lower()
+                for m in naming_re.finditer(current_message.content or "")
+            }
+            if requested_names:
+                # Walk the live guild emoji list once. Cheap on guilds with
+                # under a few hundred emojis.
+                for emoji in current_message.guild.emojis:
+                    if emoji.name and emoji.name.lower() in requested_names:
+                        name_resolved_emojis.append(
+                            (emoji.name, str(emoji.id), bool(emoji.animated))
+                        )
+        except Exception as e:
+            logger.debug(f"emoji name-resolution failed (non-fatal): {e}")
+
+    if name_resolved_emojis:
+        # Inject as a STRONG hint — the user named these explicitly, so the
+        # framing is "they asked for this, use the exact syntax" rather than
+        # "here are some options".
+        named_lines = ["[The user explicitly named the following emoji(s) in "
+                       "their message. If you use any of them in your reply, "
+                       "use the EXACT syntax shown — do not write the name in "
+                       "plain text like :cutecirno: because that won't render. "
+                       "Copy the full <:name:id> form below:]"]
+        for name, eid, animated in name_resolved_emojis:
+            syntax = f"<a:{name}:{eid}>" if animated else f"<:{name}:{eid}>"
+            named_lines.append(f"  :{name}:  →  {syntax}")
+        named_lines.append("[End named emoji list.]")
+        structured_input.append({
+            "role": "user",
+            "content": "\n".join(named_lines),
+        })
+        structured_input.append({
+            "role": "assistant",
+            "content": "(noted)",
+        })
+
+    # Server emoji RAG — semantic search this server's captioned emojis
+    # against the current message and inject any matches above threshold.
+    # Adaptive: no fixed top-k, just everything above EMOJI_RAG_MIN_SCORE
+    # capped by EMOJI_RAG_HARD_CAP. The model sees the exact `<:name:id>`
+    # syntax for each candidate so it doesn't have to guess IDs.
+    if ENABLE_EMOJI_MEMORY and current_message.guild is not None:
+        try:
+            emoji_hits = await get_relevant_emojis(
+                str(current_message.guild.id),
+                rag_query,
+                limit=EMOJI_RAG_HARD_CAP,
+                min_score=EMOJI_RAG_MIN_SCORE,
+            )
+        except Exception as e:
+            logger.debug(f"emoji RAG failed (non-fatal): {e}")
+            emoji_hits = []
+        # Skip RAG hits we already injected via name resolution — duplication
+        # confuses the model and wastes prompt budget.
+        already_offered_ids = {eid for _, eid, _ in name_resolved_emojis}
+        emoji_hits = [h for h in emoji_hits
+                      if str(h.get("emoji_id", "")) not in already_offered_ids]
+        if emoji_hits:
+            emoji_lines = ["[Server emojis you may use in your reply if they fit "
+                           "naturally — copy the syntax exactly. Pick zero, one, "
+                           "or several; do not force one in if nothing matches.]"]
+            for h in emoji_hits:
+                name = h.get("name") or "emoji"
+                eid = h.get("emoji_id") or ""
+                animated = bool(h.get("animated"))
+                cap = (h.get("caption") or "").strip()
+                # Render the exact syntax the model should emit
+                syntax = f"<a:{name}:{eid}>" if animated else f"<:{name}:{eid}>"
+                emoji_lines.append(f"  {syntax}  — {cap}")
+            emoji_lines.append("[End server emojis.]")
+            structured_input.append({
+                "role": "user",
+                "content": "\n".join(emoji_lines),
+            })
+            structured_input.append({
+                "role": "assistant",
+                "content": "(noted)",
+            })
 
     # Poll-tool primer — once every POLL_PRIME_EVERY_N user messages in this
     # channel, remind the model that the [create_poll: ...] tool exists. We
@@ -2760,6 +3359,16 @@ async def process_message_queue(channel_id):
                         # placeholder itself because Discord doesn't allow
                         # adding attachments via edit() — only the initial send.
                         recall_ids = []
+                        # Always probe the raw text for markers, even when no
+                        # images were offered — this surfaces "model emitted a
+                        # marker even though we offered no ids" as a log line
+                        # instead of silently dropping it.
+                        all_marker_matches = RECALL_IMAGE_RE.findall(final_raw or "")
+                        if all_marker_matches:
+                            logger.info(
+                                f"recall: model emitted markers={all_marker_matches} "
+                                f"offered_ids={sorted(offered_image_ids)}"
+                            )
                         if offered_image_ids:
                             _cleaned_again, recall_ids = _extract_recall_image_ids(
                                 final_raw, offered_image_ids)
@@ -2771,11 +3380,15 @@ async def process_message_queue(channel_id):
                             for img_id in recall_ids:
                                 data = await fetch_image_bytes(img_id)
                                 if not data:
+                                    logger.warning(
+                                        f"recall: fetch_image_bytes({img_id}) returned None — "
+                                        f"row may be missing or file gone"
+                                    )
                                     continue
                                 try:
                                     raw = base64.b64decode(data["image_b64"])
                                 except Exception as e:
-                                    logger.debug(f"recall: bad b64 for id={img_id}: {e}")
+                                    logger.warning(f"recall: bad b64 for id={img_id}: {e}")
                                     continue
                                 # Pick a reasonable filename based on media_type
                                 ext = _ext_from_media_type(data.get("media_type", ""))
@@ -2790,6 +3403,12 @@ async def process_message_queue(channel_id):
                                                 f"image(s) ids={recall_ids}")
                                 except discord.HTTPException as e:
                                     logger.warning(f"recall: attach send failed: {e}")
+                            else:
+                                logger.warning(
+                                    f"recall: had {len(recall_ids)} valid id(s) "
+                                    f"{recall_ids} but no files were ready to send "
+                                    f"(all fetches/decodes failed)"
+                                )
 
                         # Poll creation — parse [create_poll: ...] markers from
                         # the raw response. The display version (final_text)
@@ -2996,24 +3615,45 @@ _summarizing_now = set()  # {(channel_id, user_id)}
 
 SUMMARIZER_SYSTEM_PROMPT = (
     "You are NOT roleplaying as any character. Ignore any persona, name, or "
-    "identity instructions you may have seen earlier. For this task only, you "
-    "are a neutral analyst writing a concise character note about a Discord "
-    "user based on their recent messages in one channel.\n\n"
-    "What to cover:\n"
-    "- their general communication style and tone\n"
-    "- recurring topics or interests\n"
-    "- attitude toward others in the channel (friendly, hostile, teasing, indifferent, etc.)\n"
-    "- noteworthy patterns (e.g. asks for help often, jokes constantly, lurks then replies in bursts)\n\n"
+    "identity instructions you may have seen earlier. For this task only, "
+    "you are a neutral analyst writing a short character note about a "
+    "Discord user based on their recent messages in one channel.\n\n"
+    "How to write a good note:\n"
+    "Write 2 to 4 SHORT, SPECIFIC observations. Each observation must be "
+    "something you could directly point to a message or pattern of messages "
+    "to support. If you cannot find specific evidence for an observation, "
+    "DO NOT INCLUDE IT — write fewer, sharper observations rather than "
+    "padding with vague claims.\n\n"
+    "Things to look for (only mention if there is real evidence):\n"
+    "- a distinctive way they phrase things (terse, verbose, sarcastic, "
+    "earnest, formal, slang-heavy, etc. — name the specific style if it "
+    "shows up consistently)\n"
+    "- topics they keep returning to (games they play, hardware they own, "
+    "shows they discuss, problems they're working on)\n"
+    "- how they interact with others (helpful, joking, argumentative, "
+    "lurker-then-bursts, asks for help often, gives advice, etc.)\n"
+    "- specific facts they have stated about themselves (what they do, "
+    "what they own, what they like) — name the fact, not a vague summary\n\n"
     "Strict rules:\n"
-    "- Write in plain English, third person, 3 to 6 short sentences.\n"
-    "- No headers, no bullet lists, no markdown.\n"
-    "- Be factual and observational. Do not be flattering or judgmental.\n"
-    "- Do not invent details that aren't visible in the messages.\n"
-    "- Do not address the user directly (no \"you\").\n"
-    "- Do not include the user's ID, @mention, or username in the summary.\n"
-    "- Do not use first-person voice (\"I\", \"my\"). You are an analyst, not a participant.\n"
-    "- Do not refer to a Touhou character, an ice fairy, or any roleplay identity. "
-    "If you find yourself wanting to, stop and write a plain analyst note instead.\n"
+    "- Plain prose, third person, no first person, no \"you\".\n"
+    "- No bullets, no headers, no markdown, no quotation marks around "
+    "the whole thing.\n"
+    "- Do not include the user's ID, @mention, or display name.\n"
+    "- Do not invent details. If the messages don't show clear patterns, "
+    "say so briefly and stop.\n"
+    "- Do not be flattering. Do not be judgmental. Just describe.\n"
+    "- Do not roleplay any character (no Touhou, no ice fairy, no other "
+    "identities). If you find yourself drifting, stop and write plain "
+    "analyst prose instead.\n\n"
+    "Good example:\n"
+    "  Talks mostly about PC hardware, especially their RTX 3090 and a "
+    "recurring overheating issue they've mentioned three times. Phrases "
+    "are short and direct, often a single line. Helps others when they "
+    "ask technical questions but rarely starts conversations.\n\n"
+    "Bad example (vague, padded, no specific evidence):\n"
+    "  This user is friendly and talks about various topics. They seem "
+    "to be a part of the community and engage with others. They have "
+    "interests and opinions which they share sometimes."
 )
 
 
@@ -3246,6 +3886,156 @@ def _ext_from_media_type(mt):
         "image/gif": "gif",
         "image/webp": "webp",
     }.get(mt, "png")
+
+
+# --- Emoji captioning + observation -----------------------------------------
+
+EMOJI_CAPTIONER_SYSTEM_PROMPT = (
+    "You caption Discord custom emojis. Look at the image and write a short "
+    "phrase describing what feeling, reaction, or meaning the emoji is "
+    "typically used to convey. Examples of the right style:\n"
+    "  'expression of laughter'\n"
+    "  'frustration or cringe at someone'\n"
+    "  'approval, agreement, thumbs up'\n"
+    "  'character from anime — implies confusion or disbelief'\n"
+    "  'surprised cat with wide eyes'\n"
+    "Rules:\n"
+    "- One short phrase, no full sentences, no period at the end.\n"
+    "- Focus on the EMOTIONAL / EXPRESSIVE meaning if the emoji has one.\n"
+    "- If it's just an object or character with no clear emotional meaning, "
+    "describe what it is briefly.\n"
+    "- Do not roleplay, do not address anyone, do not use first person.\n"
+    "- Do not mention the word 'emoji'."
+)
+
+
+async def _caption_emoji(image_b64, animated):
+    """
+    Run the vision model on a Discord custom emoji and return a short
+    intent-focused caption. Returns None on failure.
+
+    The prompt biases for emotional/expressive meaning since that's how
+    the model will need to MATCH them at retrieval time ("I'm laughing"
+    -> any laugh emoji). Static-frame is fine even for animated emojis;
+    Discord's CDN serves the still PNG by default and the meaning is
+    preserved in 99% of cases.
+    """
+    media_type = "image/gif" if animated else "image/png"
+    prompt = [
+        {"role": "system", "content": EMOJI_CAPTIONER_SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Caption this emoji. One short phrase."},
+            {"type": "image_url",
+             "image_url": {"url": f"data:{media_type};base64,{image_b64}"}}
+        ]}
+    ]
+    text = await get_llm_response(
+        prompt,
+        retry=False,
+        enable_thinking=False,
+        num_predict=EMOJI_CAPTION_MAX_TOKENS,
+        temperature=0.3,
+    )
+    if not text:
+        return None
+    text = text.strip().rstrip(".").rstrip()
+    # Hard upper bound — captioner shouldn't be writing essays
+    if len(text) > 200:
+        text = text[:197].rstrip() + "..."
+    return text or None
+
+
+async def _fetch_emoji_image_for_caption(emoji_id, animated):
+    """
+    Fetch the emoji image from Discord's CDN as base64. For animated emojis
+    we still grab the GIF and the captioner reads the first frame. We could
+    request `?size=128` to keep payloads small, but the default size is
+    fine for vision-model purposes.
+    """
+    ext = "gif" if animated else "png"
+    url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+    return await _fetch_emoji_as_base64(url)
+
+
+async def _caption_and_save_emoji(emoji_id, guild_id, name, animated):
+    """
+    Background task: fetch + caption + persist one server emoji. Idempotent
+    via the in-memory _captioning_now guard and the DB's ON CONFLICT clause,
+    so concurrent observation events for the same emoji collapse safely.
+    """
+    eid = str(emoji_id)
+    if eid in _captioning_now:
+        return
+    _captioning_now.add(eid)
+    try:
+        # Confirm it's actually new — the in-memory cache might be stale
+        # if the bot just restarted.
+        if eid in _known_emoji_ids:
+            return
+        if await check_emoji_known(eid):
+            _known_emoji_ids.add(eid)
+            return
+
+        b64 = await _fetch_emoji_image_for_caption(eid, animated)
+        if not b64:
+            logger.debug(f"emoji caption: could not fetch image for :{name}: ({eid})")
+            return
+
+        caption = await _caption_emoji(b64, animated)
+        if not caption:
+            logger.debug(f"emoji caption: model returned nothing for :{name}: ({eid})")
+            return
+
+        ok = await save_emoji_to_memory(eid, guild_id, name, animated, caption)
+        if ok:
+            _known_emoji_ids.add(eid)
+            logger.info(f"emoji caption: learned :{name}: ({eid}, "
+                        f"{'animated' if animated else 'static'}): {caption[:80]!r}")
+    except Exception as e:
+        logger.error(f"_caption_and_save_emoji failed for {eid}: {e}", exc_info=True)
+    finally:
+        _captioning_now.discard(eid)
+
+
+def _observe_emojis_in_message(message):
+    """
+    Scan a message for custom emoji syntax and, for any IDs we don't already
+    know about, fire a background captioning task. Runs from on_message; never
+    blocks the user-facing reply.
+
+    We only observe emojis from messages sent IN A GUILD — DMs and group DMs
+    don't have a guild to scope captions to. We also skip the bot's own
+    messages (we never emit emojis we haven't been given) and other bots
+    (their emoji choices aren't meaningful learning signal).
+    """
+    if not ENABLE_EMOJI_MEMORY:
+        return
+    if message.guild is None:
+        return
+    if message.author.bot:
+        return
+
+    # Build the set of (emoji_id, name, animated) tuples in this message
+    found = []
+    for match in _EMOJI_RE.finditer(message.content or ""):
+        animated_flag, name, emoji_id = match.groups()
+        eid = str(emoji_id)
+        if eid in _known_emoji_ids:
+            continue
+        if eid in _captioning_now:
+            continue
+        found.append((eid, name, bool(animated_flag)))
+
+    if not found:
+        return
+
+    guild_id = str(message.guild.id)
+    for eid, name, animated in found:
+        # Fire-and-forget. Caption tasks log their own errors; we don't
+        # await them here.
+        asyncio.create_task(
+            _caption_and_save_emoji(eid, guild_id, name, animated)
+        )
 
 
 async def _save_pinged_images(message):
@@ -3516,6 +4306,76 @@ async def on_ready():
     except Exception as e:
         logger.error(f"slash sync failed: {e}", exc_info=True)
 
+    # Emoji memory startup hydration. For each guild we're in:
+    #   1. Fetch the current live emoji list from Discord
+    #   2. Tell the history service to prune any rows for emojis that are
+    #      no longer in the guild (they've been deleted)
+    #   3. Hydrate the in-memory _known_emoji_ids cache so we don't fire a
+    #      captioning task for emojis we already have stored
+    # We don't bulk-caption all emojis here — the user's design preference
+    # was incremental learning ("caption when used in chat") so the dataset
+    # grows organically with what people actually use.
+    if ENABLE_EMOJI_MEMORY:
+        try:
+            await _hydrate_emoji_memory_on_startup()
+        except Exception as e:
+            logger.error(f"emoji startup hydration failed: {e}", exc_info=True)
+
+
+async def _hydrate_emoji_memory_on_startup():
+    """Per-guild: prune stale rows + populate the in-memory known-IDs cache.
+    Called from on_ready exactly once per session."""
+    for guild in bot.guilds:
+        live_emoji_ids = [str(e.id) for e in guild.emojis]
+        # Prune the DB to match what's currently in the guild.
+        # If the guild has zero emojis, we nuke all rows for it (intentional).
+        deleted = await delete_guild_emojis_except(str(guild.id), live_emoji_ids)
+        if deleted:
+            logger.info(f"emoji startup: pruned {deleted} stale emoji(s) "
+                        f"from guild {guild.id} ({guild.name!r})")
+
+        # Hydrate the cache: ask the history service which of the live
+        # emojis we already have captions for. Could batch this but for
+        # most guilds (<200 emojis) the per-call latency is fine.
+        known = 0
+        for eid in live_emoji_ids:
+            if await check_emoji_known(eid):
+                _known_emoji_ids.add(eid)
+                known += 1
+        logger.info(f"emoji startup: guild {guild.id} has {len(live_emoji_ids)} "
+                    f"live emoji(s), {known} already captioned, "
+                    f"{len(live_emoji_ids) - known} will be learned on first use")
+
+
+@bot.event
+async def on_guild_emojis_update(guild, before, after):
+    """
+    Fired when a guild's emoji list changes (added/removed/renamed). We:
+      - prune the DB to match the new live list (deletes rows for removed emojis)
+      - update _known_emoji_ids cache to drop removed IDs
+    We DON'T pre-caption new emojis here — same incremental philosophy as
+    startup. They'll be learned the first time someone uses them.
+    """
+    if not ENABLE_EMOJI_MEMORY:
+        return
+    try:
+        before_ids = {str(e.id) for e in before}
+        after_ids = {str(e.id) for e in after}
+        removed = before_ids - after_ids
+        added = after_ids - before_ids
+
+        if removed:
+            await delete_guild_emojis_except(str(guild.id), [str(e.id) for e in after])
+            for rid in removed:
+                _known_emoji_ids.discard(rid)
+            logger.info(f"emoji update: guild {guild.id} removed {len(removed)} emoji(s)")
+
+        if added:
+            logger.info(f"emoji update: guild {guild.id} added {len(added)} emoji(s) "
+                        f"— will be learned on first use")
+    except Exception as e:
+        logger.error(f"on_guild_emojis_update failed: {e}", exc_info=True)
+
 
 @bot.event
 async def on_message(message):
@@ -3530,6 +4390,10 @@ async def on_message(message):
         _register_participant(message.channel.id, mentioned)
 
     await record_user_message(message)
+
+    # Observe any custom emojis in this message — for any we haven't seen
+    # before, fire a background captioning task. Doesn't block the reply.
+    _observe_emojis_in_message(message)
 
     # Fire off a background check to see if it's time to refresh this user's
     # personality summary. Runs only if enough new messages have accumulated;
@@ -4157,6 +5021,448 @@ async def diagnose_slash(interaction: discord.Interaction,
     lines.append(f"run `/personality target:{target.display_name}` to see it.")
     await _send_diag_slash(interaction, lines)
     logger.info(f"/diagnose by {interaction.user} for {target}: all steps passed")
+
+
+@bot.tree.command(name='diagnose_images',
+                  description='Walk the image-memory pipeline and report what works / what fails')
+async def diagnose_images_slash(interaction: discord.Interaction):
+    """
+    Diagnostic for image memory. Splits the question 'why isn't Cirno showing
+    me images?' into parts:
+      1. Is the feature enabled?
+      2. Are images getting SAVED at all (= the save flow)?
+      3. Does RAG return any hits for a sample query (= the recall flow)?
+      4. Are caption embedding dims consistent with the current model?
+
+    All output is ephemeral.
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    channel_id = str(interaction.channel_id)
+    lines = ["image memory diagnose for this channel:", ""]
+
+    # Step 1: feature flag
+    lines.append(f"1. ENABLE_IMAGE_MEMORY = {ENABLE_IMAGE_MEMORY}")
+    if not ENABLE_IMAGE_MEMORY:
+        lines.append("   ✗ feature is disabled")
+        await _send_diag_slash(interaction, lines)
+        return
+    lines.append("   ✓ ok")
+
+    # Step 2: store stats — how many images are saved in this channel?
+    lines.append("")
+    lines.append(f"2. GET /image_store_stats/{channel_id}")
+    stats = await fetch_image_store_stats(channel_id)
+    if stats is None:
+        lines.append("   ✗ history service didn't respond — is it running?")
+        await _send_diag_slash(interaction, lines)
+        return
+    count = stats.get("count", 0)
+    total_bytes = stats.get("total_bytes", 0)
+    last_dim = stats.get("last_embedding_dim")
+    lines.append(f"   saved_images count: {count}")
+    lines.append(f"   total bytes: {total_bytes}")
+    if last_dim is not None:
+        lines.append(f"   last embedding dim: {last_dim}")
+    if count == 0:
+        lines.append("   ✗ no images have been saved in this channel — the save")
+        lines.append("     flow is the broken side. Things to check:")
+        lines.append("     - has anyone uploaded an image and pinged Cirno on the")
+        lines.append("       same message? (saves only fire when she's pinged)")
+        lines.append("     - bot logs for 'image-memory: saved id=' (success)")
+        lines.append("     - bot logs for 'skip save:' (size limit, no caption)")
+        lines.append("     - is the captioner LLM call returning empty?")
+        await _send_diag_slash(interaction, lines)
+        return
+    lines.append("   ✓ ok — images are being saved")
+
+    # Show a few sample captions so you can see what the captioner produced
+    samples = stats.get("samples") or []
+    if samples:
+        lines.append("")
+        lines.append("   recent captions:")
+        for s in samples[:3]:
+            cap = (s.get("caption") or "")[:80]
+            saved_at = _relative_time(s.get("saved_at", ""))
+            lines.append(f"     id={s.get('id')} ({saved_at}): {cap!r}")
+
+    # Step 3: recall path — try a generic semantic query and see if anything
+    # comes back. We use a deliberately broad probe ("a picture") so a low
+    # match score doesn't filter everything out. If even this returns nothing,
+    # something is wrong on the embedding/RAG side.
+    lines.append("")
+    lines.append(f"3. recall probe: GET /get_relevant_images")
+    try:
+        probe = await get_relevant_images(channel_id, "a picture", limit=3)
+        lines.append(f"   returned {len(probe)} hit(s) for probe query 'a picture'")
+        if probe:
+            for h in probe[:3]:
+                score = h.get('score', 0)
+                cap = (h.get('caption') or '')[:60]
+                lines.append(f"     id={h.get('id')} score={score:.3f}: {cap!r}")
+            # Show min-score gate so we know if the bot is filtering all out
+            lines.append(f"   bot's IMAGE_RAG_MIN_SCORE = {IMAGE_RAG_MIN_SCORE}")
+            below = [h for h in probe if (h.get('score') or 0) < IMAGE_RAG_MIN_SCORE]
+            if below:
+                lines.append(f"   ⚠ {len(below)} of those hits are BELOW the bot's "
+                             f"min-score gate and would be filtered out.")
+                lines.append(f"     consider lowering IMAGE_RAG_MIN_SCORE if recall "
+                             f"never fires.")
+        else:
+            lines.append("   ✗ zero hits — possible causes:")
+            lines.append("     - embedding model changed since saves (dim mismatch silently filters)")
+            lines.append("     - history service can't reach OWUI for query embedding")
+            lines.append("   check /image_store_stats output above: if last_embedding_dim")
+            lines.append("   doesn't match what your current embedding model produces, that's it.")
+            await _send_diag_slash(interaction, lines)
+            return
+        lines.append("   ✓ ok — RAG is returning results")
+    except Exception as e:
+        lines.append(f"   ✗ exception: {e}")
+        await _send_diag_slash(interaction, lines)
+        return
+
+    # Step 4: model-emission check — has the bot actually emitted any
+    # [recall_image: N] markers recently? We don't have direct access to
+    # past final_raw values, but we can at least remind the user where to
+    # look in the logs.
+    lines.append("")
+    lines.append("4. model-emission check (manual)")
+    lines.append("   the only way to know if Cirno is EMITTING [recall_image: N]")
+    lines.append("   markers is to check MetaLLM.log for lines starting with:")
+    lines.append("     'recall: model emitted markers='   (means: she tried)")
+    lines.append("     'recall: attached N image(s)'      (means: it worked)")
+    lines.append("   if you see neither, she's never trying — possible causes:")
+    lines.append("     - persona doesn't mention recall syntax (suggested addition")
+    lines.append("       was in an earlier conversation; check persona.txt)")
+    lines.append("     - your messages don't trigger relevance: try directly asking")
+    lines.append("       'show me that image of <something visible in the captions above>'")
+
+    lines.append("")
+    lines.append("DONE — see steps above for any ✗ markers.")
+    await _send_diag_slash(interaction, lines)
+    logger.info(f"/diagnose_images by {interaction.user} in {channel_id}: "
+                f"count={count} probe_hits={len(probe) if 'probe' in locals() else '?'}")
+
+
+@bot.tree.command(name='diagnose_embeddings',
+                  description='Test whether the embedding pipeline is working right now')
+async def diagnose_embeddings_slash(interaction: discord.Interaction):
+    """
+    Live check of the embedding pipeline. Hits the history service's
+    /health/embeddings endpoint, which itself tries to embed a tiny string
+    via OWUI. Useful when /save_emoji or /add_message starts returning 503
+    and you want to know whether the issue is transient or systemic.
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines = ["embedding pipeline check:", ""]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CHAT_HISTORY_SERVICE_URL}/health/embeddings"
+            ) as r:
+                if r.status != 200:
+                    lines.append(f"   ✗ history service returned {r.status}")
+                    await _send_diag_slash(interaction, lines)
+                    return
+                data = await r.json()
+    except Exception as e:
+        lines.append(f"   ✗ could not reach history service: {e}")
+        await _send_diag_slash(interaction, lines)
+        return
+
+    status = data.get("status")
+    model = data.get("model", "?")
+    if status == "ok":
+        lines.append(f"   ✓ ok — {model} returned a {data.get('dim', '?')}-dim vector")
+        lines.append("")
+        lines.append("if /save_emoji is still failing intermittently, the issue")
+        lines.append("is most likely OWUI/Ollama timing out under load (the embedding")
+        lines.append("model gets unloaded between requests and has to cold-start).")
+        lines.append("watch the chat_history logs for 'timed out after 300s'.")
+    else:
+        lines.append(f"   ✗ embedding test FAILED for model {model!r}")
+        lines.append(f"   reason: {data.get('reason', 'unknown')}")
+        lines.append("")
+        lines.append("most likely causes (in order):")
+        lines.append("  1. the embedding model isn't pulled in your Ollama")
+        lines.append("     → ssh into the OWUI host: `ollama pull qwen3-embedding:latest`")
+        lines.append("  2. OPENWEBUI_API_KEY is missing/wrong on the chat_history side")
+        lines.append("     → check the .env in the chat_history service's working dir")
+        lines.append("  3. OWUI is up but the model is taking too long to load")
+        lines.append("     → wait a minute and rerun this command")
+
+    await _send_diag_slash(interaction, lines)
+
+
+@bot.tree.command(
+    name='recap',
+    description='Generate an ad-hoc, richer summary of a user (not stored)'
+)
+@app_commands.describe(target='The user to recap. Defaults to yourself.')
+async def recap_slash(interaction: discord.Interaction,
+                      target: discord.Member = None):
+    """
+    Builds a fresh, more detailed user note than /personality. Differences:
+      - Uses MORE messages and a richer prompt (their messages + recent
+        messages others wrote about/to them)
+      - Run on demand — does NOT update the stored personality summary
+      - Designed for when you actually want to know about someone vs. just
+        seeing the cached observation
+    Result is ephemeral.
+    """
+    target = target or interaction.user
+    channel_id = str(interaction.channel_id)
+    user_id = str(target.id)
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # Fetch the same kinds of context the opinion_of_user intent uses, but
+    # cap higher than the live-chat path because there's no streaming budget
+    # to worry about.
+    user_msgs = await _fetch_user_messages(channel_id, user_id, limit=200)
+    if not user_msgs:
+        await interaction.followup.send(
+            f"no messages from {target.display_name} in this channel — "
+            f"nothing to recap.",
+            ephemeral=True,
+        )
+        return
+    about_msgs = await get_messages_about_user(channel_id, user_id, limit=30)
+    stored_personality = await get_personality(channel_id, user_id)
+
+    # Build the combined transcript. We use timestamps + content only — the
+    # summarizer doesn't need user IDs (it's about ONE user).
+    own_lines = []
+    for m in user_msgs:
+        ts = _relative_time(m.get('timestamp', ''))
+        content = (m.get('content') or '').strip()
+        if not content:
+            continue
+        content = _EMOJI_RE.sub(r':\2:', content)
+        own_lines.append(f"({ts}) {content}")
+    own_block = "\n".join(own_lines[-200:])
+
+    about_lines = []
+    for m in about_msgs:
+        ts = _relative_time(m.get('timestamp', ''))
+        content = (m.get('content') or '').strip()
+        if not content:
+            continue
+        # Strip mentions so the summarizer doesn't echo them
+        content = _re_module.sub(r'<@!?\d+>', '@user', content)
+        content = _EMOJI_RE.sub(r':\2:', content)
+        about_lines.append(f"({ts}) {content}")
+    about_block = "\n".join(about_lines[-30:]) if about_lines else "(no messages from others mention this user)"
+
+    stored_note = ""
+    if stored_personality and (stored_personality.get('summary') or '').strip():
+        stored_note = (f"\n\nExisting analyst note about this user (you can "
+                       f"build on it but verify against the messages):\n"
+                       f"{stored_personality['summary'].strip()}")
+
+    prompt = [
+        {"role": "system", "content": SUMMARIZER_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            "Recent messages this user wrote in this channel:\n\n"
+            f"{own_block}\n\n"
+            "Recent messages from OTHERS that mention or reply to this user:\n\n"
+            f"{about_block}"
+            f"{stored_note}\n\n"
+            "Write the recap now. Remember: 2 to 4 short specific observations, "
+            "evidence-grounded, plain analyst prose, third person."
+        )},
+    ]
+
+    text = await get_llm_response(
+        prompt,
+        retry=False,
+        model=MODEL_ID_SUMMARIZER,
+        enable_thinking=False,
+        num_predict=500,           # bigger budget than the auto-summarizer
+        temperature=0.4,
+    )
+    if not text or not text.strip():
+        await interaction.followup.send(
+            f"recap failed — the LLM returned nothing. try /diagnose to "
+            f"investigate.",
+            ephemeral=True,
+        )
+        return
+
+    text = text.strip()
+    # Redact any IDs/mentions that leaked through
+    text = _re_module.sub(r'<@!?\d+>', '[user]', text)
+    text = _re_module.sub(r'\b\d{17,20}\b', '[id]', text)
+
+    body = (f"**recap of {target.display_name}** "
+            f"_(based on {len(user_msgs)} of their messages + "
+            f"{len(about_msgs)} mentions of them; not stored)_\n\n{text}")
+    if len(body) > 1900:
+        body = body[:1897].rstrip() + "..."
+    await interaction.followup.send(body, ephemeral=True)
+    logger.info(f"/recap by {interaction.user} for {target} -> {len(text)} chars")
+
+
+@bot.tree.command(
+    name='why',
+    description='Show the bot\'s most recent reasoning: intent + retrieved contexts'
+)
+async def why_slash(interaction: discord.Interaction):
+    """
+    Inspector for the most recent reply Cirno generated in THIS channel.
+    Shows:
+      - which intent the classifier picked
+      - the target user (if applicable)
+      - how many hits each retrieval path returned
+      - the raw classifier output (for debugging weird classifications)
+    Useful for tuning IMAGE_RAG / EMOJI_RAG / classifier behavior, and for
+    catching cases where the classifier is misclassifying messages.
+    """
+    channel_id = str(interaction.channel_id)
+    state = _last_intent_state.get(channel_id)
+    if state is None:
+        await interaction.response.send_message(
+            "no recorded intent state for this channel yet — Cirno needs to "
+            "have replied at least once since the last bot restart.",
+            ephemeral=True,
+        )
+        return
+
+    target_id = state.get("target_user_id")
+    target_label = "(none)"
+    if target_id:
+        # Try to resolve to a display name
+        try:
+            name = await _resolve_user_name(target_id, guild=interaction.guild)
+            target_label = f"@{name} ({target_id})" if name else target_id
+        except Exception:
+            target_label = target_id
+
+    lines = ["bot's most recent reasoning in this channel:", ""]
+    lines.append(f"  intent          : {state.get('intent')}")
+    lines.append(f"  target user     : {target_label}")
+    lines.append(f"  rag query used  : {state.get('rag_query', '')!r}")
+    lines.append(f"  default RAG hits: {state.get('default_hits_count', 0)}")
+    lines.append(f"  intent RAG hits : {state.get('intent_hits_count', 0)}")
+    supp = state.get('supplementary_blocks') or []
+    if supp:
+        lines.append(f"  extra blocks    :")
+        for b in supp:
+            lines.append(f"    - {b}")
+
+    raw = (state.get('raw_classifier_output') or '').strip()
+    if raw:
+        if len(raw) > 300:
+            raw = raw[:297] + "..."
+        lines.append("")
+        lines.append(f"  classifier raw output:")
+        lines.append(f"    {raw}")
+
+    body = "```\n" + "\n".join(lines) + "\n```"
+    if len(body) > 1900:
+        body = body[:1897] + "..."
+    await interaction.response.send_message(body, ephemeral=True)
+
+
+@bot.tree.command(name='diagnose_emojis',
+                  description='Walk the server-emoji memory pipeline and report what works')
+async def diagnose_emojis_slash(interaction: discord.Interaction):
+    """
+    Diagnostic for the server-emoji memory. Splits 'why isn't Cirno using
+    server emojis?' into:
+      1. Is the feature enabled?
+      2. How many emojis live in this guild vs how many we've captioned?
+      3. Recall probe: do RAG queries return anything above threshold?
+      4. Are we caching the right IDs in memory?
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if interaction.guild is None:
+        await interaction.followup.send(
+            "this command only works inside a guild — DMs don't have emojis.",
+            ephemeral=True,
+        )
+        return
+    guild_id = str(interaction.guild.id)
+    lines = [f"emoji memory diagnose for guild {interaction.guild.name!r}:", ""]
+
+    # Step 1
+    lines.append(f"1. ENABLE_EMOJI_MEMORY = {ENABLE_EMOJI_MEMORY}")
+    if not ENABLE_EMOJI_MEMORY:
+        lines.append("   ✗ feature is disabled")
+        await _send_diag_slash(interaction, lines)
+        return
+    lines.append("   ✓ ok")
+
+    # Step 2: stored count vs live count
+    lines.append("")
+    lines.append("2. captioned vs live emoji counts")
+    stats = await fetch_emoji_store_stats(guild_id)
+    if stats is None:
+        lines.append("   ✗ history service didn't respond")
+        await _send_diag_slash(interaction, lines)
+        return
+    captioned = int(stats.get("count", 0))
+    live = len(interaction.guild.emojis)
+    lines.append(f"   live emojis in guild: {live}")
+    lines.append(f"   captioned in DB:      {captioned}")
+    if live == 0:
+        lines.append("   ⚠ this guild has no custom emojis at all")
+    elif captioned == 0:
+        lines.append("   ⚠ no emojis captioned yet — they will be learned the")
+        lines.append("     first time someone uses them in chat. send a few")
+        lines.append("     messages with custom emojis and run this diagnostic again.")
+    elif captioned < live:
+        lines.append(f"   ({live - captioned} live emoji(s) not yet captioned —")
+        lines.append(f"   they'll be learned on first use.)")
+
+    # Show recent caption samples
+    samples = stats.get("samples") or []
+    if samples:
+        lines.append("")
+        lines.append("   recent captions (newest first):")
+        for s in samples[:5]:
+            cap = (s.get("caption") or "")[:80]
+            anim = "(animated)" if s.get("animated") else ""
+            lines.append(f"     :{s.get('name')}: {anim} — {cap!r}")
+
+    # Step 3: recall probe
+    lines.append("")
+    lines.append("3. recall probe with broad query 'reaction expressing emotion'")
+    try:
+        probe = await get_relevant_emojis(
+            guild_id, "reaction expressing emotion",
+            limit=5, min_score=0.0,  # bypass threshold to see raw scores
+        )
+        if not probe:
+            lines.append("   ✗ zero hits — probably no captions yet, or the")
+            lines.append("     embedding model can't be reached.")
+        else:
+            lines.append(f"   returned {len(probe)} hit(s):")
+            for h in probe:
+                score = h.get('score', 0)
+                cap = (h.get('caption') or '')[:50]
+                lines.append(f"     :{h.get('name')}:  score={score:.3f}  — {cap!r}")
+            lines.append(f"   bot's EMOJI_RAG_MIN_SCORE = {EMOJI_RAG_MIN_SCORE}")
+            below = [h for h in probe if (h.get('score') or 0) < EMOJI_RAG_MIN_SCORE]
+            if below:
+                lines.append(f"   ⚠ {len(below)}/{len(probe)} hits would be filtered")
+                lines.append(f"     by the threshold; lower EMOJI_RAG_MIN_SCORE if recall")
+                lines.append(f"     never fires.")
+    except Exception as e:
+        lines.append(f"   ✗ exception: {e}")
+
+    # Step 4: in-memory cache stats
+    lines.append("")
+    lines.append("4. in-memory _known_emoji_ids cache")
+    lines.append(f"   size: {len(_known_emoji_ids)} (this is per-bot-process)")
+    if _captioning_now:
+        lines.append(f"   currently captioning {len(_captioning_now)} emoji(s) in flight")
+
+    lines.append("")
+    lines.append("DONE — see steps above for any ✗ or ⚠ markers.")
+    await _send_diag_slash(interaction, lines)
+    logger.info(f"/diagnose_emojis by {interaction.user} in guild {guild_id}: "
+                f"live={live} captioned={captioned}")
 
 
 async def _send_diag_slash(interaction, lines):
